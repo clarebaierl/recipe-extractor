@@ -1,388 +1,407 @@
 # app.py
-from __future__ import annotations
-
-import asyncio
-import json
 import re
+import json
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import List, Optional, Any, Dict, Union
 
 import httpx
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString, Tag
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ValidationError, field_validator
+from pydantic import BaseModel, AnyHttpUrl, Field
 
-# -----------------------------------------------------------------------------
+# ---------------------------
 # Models
-# -----------------------------------------------------------------------------
-
-class ExtractRequest(BaseModel):
-    url: str
-
-
-class AnalyzeRequest(BaseModel):
-    """Optional second endpoint to run light analysis on an already extracted recipe."""
-    ingredients: List[str]
-    instructions: List[str]
-
+# ---------------------------
 
 class Recipe(BaseModel):
     schema_version: str = "1.0.0"
-    source_url: str
-    title: str
+    source_url: AnyHttpUrl
+    title: Optional[str] = None
     description: Optional[str] = None
-    ingredients: List[str]
-    instructions: List[str]
-    # Hardened: allow None and coerce lists/anything -> string (see validator)
+    ingredients: List[str] = []
+    instructions: List[str] = []
     recipe_yield: Optional[str] = None
-    times: Dict[str, Any] = {}
-    nutrition: Dict[str, Any] = {}
+    times: Dict[str, Union[str, int]] = {}
+    nutrition: Dict[str, Union[str, float, int]] = {}
     tags: Optional[List[str]] = None
     author: Optional[str] = None
-    extracted_at: float
+    extracted_at: float = Field(default_factory=lambda: time.time())
 
-    # --- Hardening validators ---
+class ExtractRequest(BaseModel):
+    url: AnyHttpUrl
 
-    @field_validator("recipe_yield", mode="before")
-    @classmethod
-    def coerce_recipe_yield(cls, v):
-        """
-        Some sources serialize recipeYield as a list (e.g., ["4", "4 servings"]).
-        Normalize to a single string; allow None.
-        """
-        if v is None:
-            return None
-        if isinstance(v, list):
-            return " ".join(str(x) for x in v if x)
-        return str(v)
+class AnalyzeRequest(BaseModel):
+    text: str
 
-    @field_validator("ingredients", "instructions", mode="before")
-    @classmethod
-    def ensure_list_of_strings(cls, v):
-        """
-        Normalize to list[str]. Accept a single string or a list of mixed types.
-        """
-        if v is None:
-            return []
-        if isinstance(v, (str, bytes)):
-            return [str(v)]
-        return [str(x) for x in v if x is not None]
+# ---------------------------
+# FastAPI
+# ---------------------------
 
-
-# -----------------------------------------------------------------------------
-# App
-# -----------------------------------------------------------------------------
-
-app = FastAPI(title="Recipe Extractor", version="1.0.0")
-
-# CORS for convenience (adjust for production)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+app = FastAPI(
+    title="Recipe Extractor",
+    version="1.0.0",
+    description="Extract a normalized recipe JSON from a public recipe URL."
 )
 
+ALLOWED_SCHEMES = {"http", "https"}
+DEFAULT_HEADERS = {
+    "user-agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "accept-language": "en-US,en;q=0.9",
+}
 
-# -----------------------------------------------------------------------------
+# ---------------------------
 # Helpers
-# -----------------------------------------------------------------------------
+# ---------------------------
 
-ISO8601_DURATION = re.compile(
-    r"^P(?:(?P<years>\d+)Y)?(?:(?P<months>\d+)M)?(?:(?P<weeks>\d+)W)?(?:(?P<days>\d+)D)?"
-    r"(?:T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+)S)?)?$",
-    re.IGNORECASE,
-)
+def _clean_text(t: str) -> str:
+    t = re.sub(r"\s+", " ", t or "").strip()
+    # strip unicode bullets and odd whitespace
+    t = t.lstrip("•·-–—").strip()
+    return t
 
+def _as_list(x: Any) -> List[Any]:
+    if x is None:
+        return []
+    if isinstance(x, list):
+        return x
+    return [x]
 
-def parse_iso8601_duration_to_minutes(value: str) -> Optional[int]:
-    """
-    Convert ISO-8601 duration like 'PT1H30M' or 'P0DT45M' to total minutes.
-    Returns None if it doesn't match.
-    """
-    if not value or not isinstance(value, str):
-        return None
-    m = ISO8601_DURATION.match(value.strip())
-    if not m:
-        return None
-
-    parts = {k: int(v) if v else 0 for k, v in m.groupdict().items()}
-
-    # Map years/months/weeks/days to minutes (rough approximations for recipes).
-    minutes = (
-        parts["years"] * 525600
-        + parts["months"] * 43800
-        + parts["weeks"] * 7 * 24 * 60
-        + parts["days"] * 24 * 60
-        + parts["hours"] * 60
-        + parts["minutes"]
-        + (parts["seconds"] // 60)
-    )
-    return minutes if minutes > 0 else None
-
-
-def first_non_empty(*values: Any) -> Optional[str]:
-    for v in values:
-        if isinstance(v, str) and v.strip():
-            return v.strip()
+def _first(*vals):
+    for v in vals:
+        if v:
+            return v
     return None
 
+async def fetch_html(url: str, timeout: float = 12.0) -> str:
+    # Scheme guard
+    if url.split(":", 1)[0].lower() not in ALLOWED_SCHEMES:
+        raise HTTPException(status_code=400, detail="Only http/https URLs are allowed.")
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, headers=DEFAULT_HEADERS, timeout=timeout) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            # Some CDNs serve weird encodings; httpx will decode, but be defensive:
+            content = resp.text or resp.content.decode(resp.encoding or "utf-8", errors="ignore")
+            return content
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {e!s}")
 
-def normalize_list(value: Any) -> List[str]:
-    if value is None:
-        return []
-    if isinstance(value, (str, bytes)):
-        return [str(value).strip()]
-    if isinstance(value, list):
-        return [str(x).strip() for x in value if str(x).strip()]
-    # Fallback: coerce anything else to one string
-    return [str(value).strip()]
-
-
-def pick_recipe_from_jsonld(ld: Any) -> Optional[Dict[str, Any]]:
+def _pick_recipe_from_ld(ld: Any) -> Optional[Dict[str, Any]]:
     """
-    Given already loaded JSON-LD object (dict/list), try to find a Recipe node.
+    Given a decoded JSON-LD payload (dict/list), find a dict whose @type includes 'Recipe'.
+    Supports items inside @graph, arrays, nested objects.
     """
+    def is_recipe_obj(obj: Any) -> bool:
+        if not isinstance(obj, dict):
+            return False
+        t = obj.get("@type")
+        if isinstance(t, list):
+            return any(str(x).lower() == "recipe" for x in t)
+        if isinstance(t, str):
+            return t.lower() == "recipe"
+        return False
+
+    # Direct dict
     if isinstance(ld, dict):
-        # @graph or a single node
+        if is_recipe_obj(ld):
+            return ld
+        # @graph case
         graph = ld.get("@graph")
         if isinstance(graph, list):
             for node in graph:
-                if isinstance(node, dict) and node.get("@type") in ("Recipe", ["Recipe"]):
+                if is_recipe_obj(node):
                     return node
-        if ld.get("@type") in ("Recipe", ["Recipe"]):
-            return ld
-    elif isinstance(ld, list):
-        for node in ld:
-            if isinstance(node, dict) and node.get("@type") in ("Recipe", ["Recipe"]):
-                return node
+        # Thing with mainEntity
+        me = ld.get("mainEntity")
+        if is_recipe_obj(me):
+            return me
+        if isinstance(me, list):
+            for node in me:
+                if is_recipe_obj(node):
+                    return node
+
+    # Array of things
+    if isinstance(ld, list):
+        for item in ld:
+            r = _pick_recipe_from_ld(item)
+            if r:
+                return r
     return None
 
+def _normalize_yield(raw: Any) -> Optional[str]:
+    if raw is None:
+        return None
+    if isinstance(raw, list):
+        raw = " / ".join([_clean_text(str(x)) for x in raw if x])
+    return _clean_text(str(raw))
 
-async def fetch_html(url: str, timeout: float = 20.0) -> str:
-    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers={
-        "User-Agent": "Mozilla/5.0 (compatible; RecipeExtractor/1.0; +https://example.com)"
-    }) as client:
-        r = await client.get(url)
-        r.raise_for_status()
-        return r.text
+def _normalize_ingredients(raw: Any) -> List[str]:
+    out: List[str] = []
+    for item in _as_list(raw):
+        if isinstance(item, str):
+            out.append(_clean_text(item))
+        elif isinstance(item, dict):
+            # Some sites wrap ingredients as objects with 'text'
+            out.append(_clean_text(item.get("text") or item.get("name") or ""))
+    return [x for x in out if x]
 
-
-def extract_from_html(html: str) -> Dict[str, Any]:
+def _flatten_instruction_node(node: Any) -> List[str]:
     """
-    Minimal HTML fallback if JSON-LD is missing/partial.
-    Best-effort: tries common classes/ids for ingredients & instructions.
+    Handles strings, HowToStep dicts with 'text', HowToSection with 'itemListElement', or lists.
     """
-    soup = BeautifulSoup(html, "html.parser")
+    steps: List[str] = []
+    if node is None:
+        return steps
+    if isinstance(node, str):
+        t = _clean_text(node)
+        if t:
+            steps.append(t)
+        return steps
+    if isinstance(node, list):
+        for n in node:
+            steps.extend(_flatten_instruction_node(n))
+        return steps
+    if isinstance(node, dict):
+        node_type = node.get("@type") or ""
+        # HowToSection: recurse into itemListElement
+        if isinstance(node.get("itemListElement"), list):
+            for n in node["itemListElement"]:
+                steps.extend(_flatten_instruction_node(n))
+        # HowToStep or generic object with 'text'
+        t = _clean_text(node.get("text") or node.get("name") or "")
+        if t:
+            steps.append(t)
+        return steps
+    return steps
 
-    # Title / description
-    title = first_non_empty(
-        getattr(soup.find("meta", property="og:title"), "get", lambda *_: None)("content", None),
-        getattr(soup.find("title"), "text", None),
-        getattr(soup.find("h1"), "text", None),
-    )
-    description = first_non_empty(
-        getattr(soup.find("meta", property="og:description"), "get", lambda *_: None)("content", None),
-        getattr(soup.find("meta", attrs={"name": "description"}), "get", lambda *_: None)("content", None),
-    )
+def _extract_json_ld(soup: BeautifulSoup) -> Optional[Dict[str, Any]]:
+    """
+    Iterate all JSON-LD scripts; choose the most complete Recipe object.
+    """
+    best: Optional[Dict[str, Any]] = None
+    best_score = -1
 
-    # Very light-weight guesses
-    ingredients = []
-    for selector in ["li.ingredient", "li.ingredients-item", ".ingredients-section li", "li[itemprop='recipeIngredient']"]:
-        for li in soup.select(selector):
-            text = li.get_text(" ", strip=True)
-            if text:
-                ingredients.append(text)
+    for script in soup.find_all("script", type=lambda v: v and "ld+json" in v):
+        raw = script.string or script.get_text(strip=True)
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            # Sometimes there's invalid JSON; try to fix common trailing commas
+            try:
+                payload = json.loads(re.sub(r",\s*}", "}", re.sub(r",\s*]", "]", raw)))
+            except Exception:
+                continue
+        recipe_obj = _pick_recipe_from_ld(payload)
+        if not recipe_obj:
+            continue
+
+        # Quick “completeness” score to prefer objects with ingredients & instructions
+        ingr = _normalize_ingredients(recipe_obj.get("recipeIngredient"))
+        instr = _flatten_instruction_node(recipe_obj.get("recipeInstructions"))
+        score = (len(ingr) > 0) + (len(instr) > 0)
+
+        if score > best_score:
+            best = recipe_obj
+            best_score = score
+
+    return best
+
+def _collect_text_from_list(root: Tag) -> List[str]:
+    items: List[str] = []
+    for li in root.find_all(["li", "p"], recursive=True):
+        # Only take direct text, not nested section headers etc.
+        txt = " ".join(li.stripped_strings)
+        txt = _clean_text(txt)
+        if txt:
+            items.append(txt)
+    return items
+
+def _fallback_from_html(soup: BeautifulSoup) -> Dict[str, List[str]]:
+    """
+    Broad HTML fallback for ingredients and instructions.
+    Targets Simply Recipes and many other sites.
+    """
+    ingredients: List[str] = []
+    instructions: List[str] = []
+
+    # --- INGREDIENTS ---
+    # Common Simply Recipes / Dotdash patterns:
+    ingr_candidates = [
+        # Simply Recipes & Dotdash
+        {"css": "ul.structured-ingredients__list"},
+        {"css": "ul.mntl-structured-ingredients__list"},
+        {"css": "[data-ingredient-list], ul[data-ingredient-list]"},
+        # microdata
+        {"css": "[itemprop='recipeIngredient']"},
+        # generic
+        {"css": "ul[class*='ingredient']"},
+        {"css": "div[class*='ingredient'] ul"},
+    ]
+
+    for cand in ingr_candidates:
+        for node in soup.select(cand["css"]):
+            ingredients.extend(_collect_text_from_list(node))
         if ingredients:
             break
 
-    instructions = []
-    for selector in ["li.instruction", "li.instructions-section-item", ".instructions-section li", "li[itemprop='recipeInstructions']"]:
-        for li in soup.select(selector):
-            text = li.get_text(" ", strip=True)
-            if text:
-                instructions.append(text)
+    # A more generic catch:
+    if not ingredients:
+        for ul in soup.find_all("ul"):
+            cls = " ".join(ul.get("class", []))
+            if re.search(r"ingredient", cls, re.I):
+                ingredients.extend(_collect_text_from_list(ul))
+        ingredients = [x for x in ingredients if x]
+
+    # --- INSTRUCTIONS ---
+    instr_candidates = [
+        {"css": "section.instructions-section"},
+        {"css": "ol.mntl-structured-instructions__list"},      # Dotdash
+        {"css": "ol[class*='instruction']"},
+        {"css": "ul[class*='instruction']"},
+        {"css": "[itemprop='recipeInstructions']"},
+        {"css": "div[class*='direction'] ol"},
+        {"css": "div[class*='method'] ol"},
+    ]
+
+    for cand in instr_candidates:
+        for node in soup.select(cand["css"]):
+            instructions.extend(_collect_text_from_list(node))
         if instructions:
             break
 
-    return {
-        "title": title or "",
-        "description": description,
-        "ingredients": ingredients,
-        "instructions": instructions,
+    if not instructions:
+        # Very generic fallback: look for ordered lists that look like steps
+        for ol in soup.find_all("ol"):
+            cls = " ".join(ol.get("class", []))
+            if re.search(r"(instruction|direction|method|step)", cls, re.I):
+                instructions.extend(_collect_text_from_list(ol))
+        instructions = [x for x in instructions if x]
+
+    return {"ingredients": ingredients, "instructions": instructions}
+
+def _extract_fields_from_recipe_obj(obj: Dict[str, Any]) -> Dict[str, Any]:
+    title = _first(obj.get("name"), obj.get("headline"))
+    description = _clean_text(_first(obj.get("description"), obj.get("summary")) or "")
+    author = None
+    auth = obj.get("author")
+    if isinstance(auth, dict):
+        author = _first(auth.get("name"), auth.get("@name"))
+    elif isinstance(auth, list) and auth:
+        if isinstance(auth[0], dict):
+            author = auth[0].get("name")
+        else:
+            author = str(auth[0])
+
+    ingredients = _normalize_ingredients(obj.get("recipeIngredient"))
+    instructions = _flatten_instruction_node(obj.get("recipeInstructions"))
+
+    times = {}
+    for key in ["prepTime", "cookTime", "totalTime"]:
+        if obj.get(key):
+            times[key] = _clean_text(obj[key])
+
+    nutrition = {}
+    nut = obj.get("nutrition")
+    if isinstance(nut, dict):
+        for k, v in nut.items():
+            if v is None:
+                continue
+            if isinstance(v, (int, float)):
+                nutrition[k] = v
+            else:
+                nutrition[k] = _clean_text(str(v))
+
+    tags = None
+    keyw = obj.get("keywords")
+    if isinstance(keyw, str):
+        tags = [x.strip() for x in keyw.split(",") if x.strip()]
+    elif isinstance(keyw, list):
+        tags = [str(x).strip() for x in keyw if str(x).strip()]
+
+    return dict(
+        title=_clean_text(title or ""),
+        description=description or None,
+        author=_clean_text(author or "") or None,
+        ingredients=ingredients,
+        instructions=instructions,
+        recipe_yield=_normalize_yield(obj.get("recipeYield")),
+        times=times,
+        nutrition=nutrition,
+        tags=tags or None,
+    )
+
+# ---------------------------
+# Endpoints
+# ---------------------------
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
+
+@app.post("/extract", response_model=Recipe)
+async def extract(req: ExtractRequest):
+    html = await fetch_html(str(req.url))
+    soup = BeautifulSoup(html, "lxml")
+
+    # 1) Try JSON-LD (robust)
+    obj = _extract_json_ld(soup)
+
+    data: Dict[str, Any] = {
+        "title": None,
+        "description": None,
+        "author": None,
+        "ingredients": [],
+        "instructions": [],
         "recipe_yield": None,
         "times": {},
         "nutrition": {},
         "tags": None,
-        "author": None,
     }
 
+    if obj:
+        data.update(_extract_fields_from_recipe_obj(obj))
 
-def extract_from_jsonld(html: str) -> Optional[Dict[str, Any]]:
-    """
-    Parse JSON-LD and return a dict with normalized recipe fields if found.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    scripts = soup.find_all("script", type=lambda t: t and "ld+json" in t)
+    # 2) Fallback to HTML if needed or if JSON-LD is incomplete
+    if not data["ingredients"] or not data["instructions"]:
+        fallback = _fallback_from_html(soup)
+        if not data["ingredients"]:
+            data["ingredients"] = fallback["ingredients"]
+        if not data["instructions"]:
+            data["instructions"] = fallback["instructions"]
 
-    for s in scripts:
-        try:
-            data = json.loads(s.string or s.text or "")
-        except Exception:
-            continue
+    # 3) Title/description fallback from DOM
+    if not data["title"]:
+        ttl = soup.find("meta", property="og:title") or soup.find("title")
+        data["title"] = _clean_text(ttl.get("content") if ttl and ttl.has_attr("content") else (ttl.get_text() if ttl else "")) or None
+    if not data["description"]:
+        md = soup.find("meta", property="og:description") or soup.find("meta", attrs={"name": "description"})
+        if md and md.has_attr("content"):
+            data["description"] = _clean_text(md["content"]) or None
 
-        recipe = pick_recipe_from_jsonld(data)
-        if not recipe:
-            continue
-
-        # Title / description
-        title = first_non_empty(
-            recipe.get("name"),
-            recipe.get("headline"),
-        )
-        description = recipe.get("description")
-
-        # Ingredients (variously named)
-        ingredients_raw = recipe.get("recipeIngredient") or recipe.get("ingredients")
-        ingredients = normalize_list(ingredients_raw)
-
-        # Instructions can be string, list of strings, or list of HowToStep dicts
-        instructions_raw = recipe.get("recipeInstructions")
-        instructions: List[str] = []
-        if isinstance(instructions_raw, list):
-            for item in instructions_raw:
-                if isinstance(item, dict):
-                    # HowToStep or HowToSection
-                    txt = first_non_empty(item.get("text"), item.get("name"))
-                    if txt:
-                        instructions.append(txt)
-                else:
-                    txt = str(item).strip()
-                    if txt:
-                        instructions.append(txt)
-        elif isinstance(instructions_raw, str):
-            # split heuristically on newlines / periods if it looks like a paragraph
-            parts = [p.strip() for p in re.split(r"[\n\r]+", instructions_raw) if p.strip()]
-            instructions = parts if parts else [instructions_raw.strip()]
-
-        # Yield
-        recipe_yield = recipe.get("recipeYield")
-
-        # Times
-        times: Dict[str, Any] = {}
-        # Many sites use ISO 8601 for totalTime, prepTime, cookTime, etc.
-        for key, out in [
-            ("totalTime", "total_minutes"),
-            ("prepTime", "prep_minutes"),
-            ("cookTime", "cook_minutes"),
-            ("performTime", "perform_minutes"),
-        ]:
-            mins = parse_iso8601_duration_to_minutes(recipe.get(key))
-            if mins is not None:
-                times[out] = mins
-
-        # Nutrition
-        nutrition = {}
-        if isinstance(recipe.get("nutrition"), dict):
-            nutrition = {k: v for k, v in recipe["nutrition"].items() if v not in (None, "")}
-
-        # Tags
-        keywords = recipe.get("keywords")
-        tags: Optional[List[str]] = None
-        if isinstance(keywords, str):
-            tags = [t.strip() for t in keywords.split(",") if t.strip()]
-        elif isinstance(keywords, list):
-            tags = [str(t).strip() for t in keywords if str(t).strip()]
-
-        # Author
-        author = None
-        auth = recipe.get("author")
-        if isinstance(auth, dict):
-            author = first_non_empty(auth.get("name"))
-        elif isinstance(auth, list) and auth:
-            if isinstance(auth[0], dict):
-                author = first_non_empty(auth[0].get("name"))
-            else:
-                author = str(auth[0]).strip()
-        elif isinstance(auth, str):
-            author = auth.strip()
-
-        return {
-            "title": title or "",
-            "description": description,
-            "ingredients": ingredients,
-            "instructions": instructions,
-            "recipe_yield": recipe_yield,
-            "times": times,
-            "nutrition": nutrition,
-            "tags": tags,
-            "author": author,
-        }
-
-    return None
-
-
-# -----------------------------------------------------------------------------
-# Endpoints
-# -----------------------------------------------------------------------------
-
-@app.get("/")
-def health() -> Dict[str, str]:
-    return {"status": "ok", "service": "recipe-extractor"}
-
-
-@app.post("/extract", response_model=Recipe)
-async def extract(req: ExtractRequest) -> Recipe:
-    """
-    Extract a normalized recipe JSON from a public recipe URL.
-    """
-    try:
-        html = await fetch_html(req.url)
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch URL: {e}") from e
-
-    # Prefer JSON-LD; fall back to light HTML heuristics
-    data = extract_from_jsonld(html) or extract_from_html(html)
-
-    # Build model with validation; convert validation errors to 422 for the client
-    try:
-        recipe = Recipe(
-            schema_version="1.0.0",
-            source_url=req.url,
-            title=data["title"] or "",
-            description=data.get("description"),
-            ingredients=data.get("ingredients") or [],
-            instructions=data.get("instructions") or [],
-            recipe_yield=data.get("recipe_yield"),
-            times=data.get("times") or {},
-            nutrition=data.get("nutrition") or {},
-            tags=data.get("tags"),
-            author=data.get("author"),
-            extracted_at=time.time(),
-        )
-    except ValidationError as e:
-        # Expose which field failed (instead of a 500)
-        raise HTTPException(status_code=422, detail=e.errors())
-
+    # Build and return
+    recipe = Recipe(
+        source_url=str(req.url),
+        title=data["title"],
+        description=data["description"],
+        ingredients=data["ingredients"],
+        instructions=data["instructions"],
+        recipe_yield=data["recipe_yield"],
+        times=data["times"],
+        nutrition=data["nutrition"],
+        tags=data["tags"],
+        author=data["author"],
+    )
     return recipe
 
-
 @app.post("/analyze")
-def analyze(req: AnalyzeRequest) -> Dict[str, Any]:
-    """
-    Tiny example analyzer: counts ingredients, steps, and estimates complexity.
-    """
-    ing_count = len([i for i in req.ingredients if i.strip()])
-    step_count = len([s for s in req.instructions if s.strip()])
-    complexity = "easy"
-    if ing_count >= 12 or step_count >= 10:
-        complexity = "hard"
-    elif ing_count >= 7 or step_count >= 6:
-        complexity = "medium"
+async def analyze(req: AnalyzeRequest):
+    text = re.sub(r"\s+", " ", req.text or "").strip()
+    return {"length": len(text), "preview": text[:160]}
 
-    return {
-        "ingredients_count": ing_count,
-        "steps_count": step_count,
-        "estimated_complexity": complexity,
-    }
