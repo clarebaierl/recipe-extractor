@@ -1,273 +1,279 @@
+import os
 import json
 import re
-import time
-from typing import List, Optional, Dict, Any
+from typing import Any, Dict, List, Optional, Union
 
 import requests
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, Body, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from starlette.middleware.cors import CORSMiddleware
 
+# ---------- FastAPI setup ----------
 app = FastAPI(
     title="Recipe Extractor",
     version="1.0.0",
     description="Extract a normalized recipe JSON from a public recipe URL.",
 )
 
-# ---- Models -----------------------------------------------------------------
+# CORS: keep permissive for now; lock down later if you need
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-class Times(BaseModel):
-    prepTime: Optional[str] = None   # human friendly e.g. "20 mins" or "6 hrs 20 mins"
-    cookTime: Optional[str] = None
-    totalTime: Optional[str] = None
-
-class Recipe(BaseModel):
-    schema_version: str = Field(default="1.0.0")
-    source_url: str
-    title: Optional[str] = None
-    description: Optional[str] = None
-    ingredients: List[str] = Field(default_factory=list)
-    instructions: List[str] = Field(default_factory=list)
-    times: Times = Field(default_factory=Times)
-    nutrition: Dict[str, Any] = Field(default_factory=dict)
-    tags: List[str] = Field(default_factory=list)
-    author: Optional[str] = None
-    extracted_at: int
-
+# ---------- Models ----------
 class ExtractRequest(BaseModel):
     url: str
 
-# ---- Helpers ----------------------------------------------------------------
+# ---------- Helpers ----------
 
-BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/127.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.google.com/",
-    "Connection": "close"
-}
-
-SESSION = requests.Session()
-SESSION.headers.update(BROWSER_HEADERS)
-SESSION.timeout = 20  # default per-request timeout
-
-ISO_DUR_RE = re.compile(
-    r"^P(?:(?P<years>\d+)Y)?(?:(?P<months>\d+)M)?(?:(?P<weeks>\d+)W)?(?:(?P<days>\d+)D)?"
-    r"(?:T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+)S)?)?$",
-    re.IGNORECASE,
+UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/127.0.0.0 Safari/537.36"
 )
 
-def iso8601_to_human(iso: Optional[str]) -> Optional[str]:
-    if not iso:
-        return None
-    m = ISO_DUR_RE.match(iso.strip())
-    if not m:
-        return None
-    parts = {k: int(v) for k, v in m.groupdict(default="0").items()}
-    minutes_total = (
-        parts["years"] * 525600
-        + parts["months"] * 43800
-        + parts["weeks"] * 10080
-        + parts["days"] * 1440
-        + parts["hours"] * 60
-        + parts["minutes"]
-        + (1 if parts["seconds"] and int(parts["seconds"]) > 0 else 0)
-    )
-    if minutes_total <= 0:
-        return None
-    hours, mins = divmod(minutes_total, 60)
-    if hours == 0:
-        return f"{mins} mins"
-    if mins == 0:
-        return f"{hours} hr" if hours == 1 else f"{hours} hrs"
-    return f"{hours} hr {mins} mins" if hours == 1 else f"{hours} hrs {mins} mins"
+HEADERS = {
+    "User-Agent": UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
 
 def fetch_html(url: str) -> str:
-    # Small retry to dodge transient 403/460s
-    last_exc = None
-    for i in range(2):
-        try:
-            resp = SESSION.get(url, timeout=20)
-            if resp.status_code in (403, 429, 460):
-                # brief pause and retry once with slightly different headers
-                time.sleep(0.8)
-                SESSION.headers["Accept-Language"] = "en-US,en;q=0.8"
-                resp = SESSION.get(url, timeout=20)
-            resp.raise_for_status()
-            return resp.text
-        except requests.RequestException as e:
-            last_exc = e
-            time.sleep(0.5)
-    raise HTTPException(status_code=502, detail=f"Failed to fetch URL: {last_exc}")
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+        return resp.text
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch URL: {e}")
 
-def coerce_list(v) -> List[str]:
-    if v is None:
-        return []
-    if isinstance(v, list):
-        # flatten HowToStep-like objects or nested
-        out = []
-        for item in v:
-            if isinstance(item, dict) and "text" in item:
-                text = (item.get("text") or "").strip()
-                if text:
-                    out.append(text)
-            elif isinstance(item, str):
-                s = item.strip()
-                if s:
-                    out.append(s)
-        return out
-    if isinstance(v, str):
-        s = v.strip()
-        return [s] if s else []
-    return []
 
-def normalize_text_items(items: List[str]) -> List[str]:
-    # Remove accidental numbering/gluing, trim, collapse whitespace
-    out = []
+def clean_str(s: str) -> str:
+    # collapse whitespace and strip
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def to_human_time(iso: Optional[str]) -> Optional[str]:
+    """Convert ISO-8601 durations (e.g., PT6H20M) to '6 hrs 20 mins'."""
+    if not iso:
+        return None
+    m = re.fullmatch(
+        r"P(?:(?P<days>\d+)D)?(?:T(?:(?P<hours>\d+)H)?(?:(?P<mins>\d+)M)?(?:(?P<secs>\d+)S)?)?",
+        iso.strip().upper(),
+    )
+    if not m:
+        # some sites put just minutes like 'PT360M' or 'PT20M'
+        return iso
+    days = int(m.group("days") or 0)
+    hours = int(m.group("hours") or 0)
+    mins = int(m.group("mins") or 0)
+    secs = int(m.group("secs") or 0)
+
+    total_mins = days * 24 * 60 + hours * 60 + mins
+    h, r = divmod(total_mins, 60)
+    parts = []
+    if h:
+        parts.append(f"{h} hr" + ("s" if h != 1 else ""))
+    if r:
+        parts.append(f"{r} min" + ("s" if r != 1 else ""))
+    if not parts and secs:
+        parts.append(f"{secs} sec" + ("s" if secs != 1 else ""))
+    if not parts:
+        parts.append("0 mins")
+    return " ".join(parts)
+
+
+# --- Run-on item splitter ---
+_RUNON_SPLIT_PATTERN = re.compile(
+    # Insert a split *before* a number that immediately follows a letter or ')'
+    r"(?<=[A-Za-z\)])(?=\d)"
+)
+
+def split_runons(items: List[str]) -> List[str]:
+    """
+    Fix ingredients that accidentally merged, e.g.:
+      '... Cabernet Sauvignon3 ribs celery, chopped2 medium parsnips ...'
+    by splitting into separate items where a number follows a letter with no space.
+    """
+    fixed: List[str] = []
     for raw in items:
-        s = re.sub(r"\s+", " ", raw).strip()
-        # Sometimes publishers prefix items with step numbers or bullets; drop “1)”, “1.”, “- ”
-        s = re.sub(r"^\s*(?:[-•]\s*|\d+[\).\s]+)\s*", "", s)
-        if s:
-            out.append(s)
-    return out
+        # First normalize whitespace
+        piece = clean_str(raw)
 
-def parse_json_ld(soup: BeautifulSoup) -> Dict[str, Any]:
-    # Find all <script type="application/ld+json"> blocks and merge/choose the Recipe one
-    for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        # If there's an obvious run-on boundary, split there
+        parts = _RUNON_SPLIT_PATTERN.split(piece)
+
+        # The split keeps numbers at the start of new parts; now each part is a candidate item.
+        for p in parts:
+            p = clean_str(p)
+            if not p:
+                continue
+            fixed.append(p)
+    return fixed
+
+
+def ensure_list(x: Union[str, List[Any], None]) -> List[str]:
+    if x is None:
+        return []
+    if isinstance(x, list):
+        # Extract text if elements are dicts like {"@type":"HowToStep","text":"..."}
+        out: List[str] = []
+        for el in x:
+            if isinstance(el, dict) and "text" in el:
+                out.append(clean_str(str(el["text"])))
+            else:
+                out.append(clean_str(str(el)))
+        return out
+    return [clean_str(str(x))]
+
+
+def extract_from_jsonld(soup: BeautifulSoup) -> Optional[Dict[str, Any]]:
+    scripts = soup.find_all("script", {"type": "application/ld+json"})
+    candidates: List[Dict[str, Any]] = []
+    for sc in scripts:
         try:
-            data = json.loads(tag.string or tag.text or "")
+            data = json.loads(sc.string or sc.get_text() or "")
         except Exception:
             continue
-        # JSON-LD can be an array or a dict with @graph
-        candidates = []
-        if isinstance(data, list):
-            candidates = data
-        elif isinstance(data, dict):
-            if "@graph" in data and isinstance(data["@graph"], list):
-                candidates = data["@graph"]
-            else:
-                candidates = [data]
-        for node in candidates:
-            t = node.get("@type")
-            # Could be ["Recipe", ...] or a single string
-            if (isinstance(t, str) and t.lower() == "recipe") or (
-                isinstance(t, list) and any(str(x).lower() == "recipe" for x in t)
-            ):
-                return node
-    return {}
 
-def extract_from_html_fallback(soup: BeautifulSoup) -> Dict[str, Any]:
-    # Best-effort fallback: lists under common containers
-    ingredients = []
-    instructions = []
-    # Ingredients: look for UL/OL with ingredient-ish hints
-    for ul in soup.find_all(["ul", "ol"]):
-        hint = (ul.get("class") or []) + [ul.get("id") or ""]
-        hint_text = " ".join(hint).lower()
-        if "ingredient" in hint_text:
-            for li in ul.find_all("li"):
-                txt = li.get_text(" ", strip=True)
-                if txt:
-                    ingredients.append(txt)
-    # Instructions (steps)
-    for ol in soup.find_all(["ol", "ul"]):
-        hint = (ol.get("class") or []) + [ol.get("id") or ""]
-        hint_text = " ".join(hint).lower()
-        if "instruction" in hint_text or "direction" in hint_text or "method" in hint_text or "step" in hint_text:
-            for li in ol.find_all("li"):
-                txt = li.get_text(" ", strip=True)
-                if txt:
-                    instructions.append(txt)
+        def push(obj: Any):
+            if isinstance(obj, dict):
+                t = obj.get("@type")
+                if isinstance(t, list):
+                    tset = {str(v).lower() for v in t}
+                else:
+                    tset = {str(t).lower()} if t else set()
+                if "recipe" in tset:
+                    candidates.append(obj)
+            elif isinstance(obj, list):
+                for o in obj:
+                    push(o)
 
-    # If still empty, be conservative rather than grabbing raw paragraphs (which can glue numbers)
-    return {
-        "ingredients": normalize_text_items(ingredients),
-        "instructions": normalize_text_items(instructions),
+        push(data)
+
+    if not candidates:
+        return None
+
+    # Heuristic: prefer the one that has most recipe fields
+    best = max(
+        candidates,
+        key=lambda d: sum(k in d for k in ("name", "recipeIngredient", "recipeInstructions")),
+    )
+
+    # Normalize out
+    title = clean_str(best.get("name") or "")
+    description = clean_str(best.get("description") or "")
+    author = ""
+    au = best.get("author")
+    if isinstance(au, dict):
+        author = clean_str(au.get("name") or "")
+    elif isinstance(au, list) and au:
+        if isinstance(au[0], dict):
+            author = clean_str(au[0].get("name") or "")
+        else:
+            author = clean_str(str(au[0]))
+    elif isinstance(au, str):
+        author = clean_str(au)
+
+    ingredients = ensure_list(best.get("recipeIngredient"))
+    ingredients = split_runons(ingredients)  # <- fix run-ons here
+
+    instructions = ensure_list(best.get("recipeInstructions"))
+
+    times = {
+        "prepTime": to_human_time(best.get("prepTime")),
+        "cookTime": to_human_time(best.get("cookTime")),
+        "totalTime": to_human_time(best.get("totalTime")),
     }
 
-def build_recipe(url: str, html: str) -> Recipe:
-    soup = BeautifulSoup(html, "html.parser")
+    # Optional: nutrition object sometimes present
+    nutrition = best.get("nutrition") if isinstance(best.get("nutrition"), dict) else {}
 
-    data = parse_json_ld(soup)
+    # Tags (keywords) can be comma string or list
+    tags: List[str] = []
+    kw = best.get("keywords")
+    if isinstance(kw, str):
+        tags = [clean_str(k) for k in kw.split(",") if clean_str(k)]
+    elif isinstance(kw, list):
+        tags = [clean_str(k) for k in kw]
 
-    # Title & description
-    title = data.get("name") or soup.title.string.strip() if soup.title else None
-    description = (data.get("description") or "").strip() or None
+    return {
+        "title": title,
+        "description": description,
+        "author": author,
+        "ingredients": ingredients,
+        "instructions": instructions,
+        "times": {k: v for k, v in times.items() if v},
+        "nutrition": nutrition or {},
+        "tags": tags,
+    }
 
-    # Ingredients & instructions (prefer JSON-LD)
-    ingredients = coerce_list(data.get("recipeIngredient"))
-    instructions_raw = data.get("recipeInstructions")
-    instructions = coerce_list(instructions_raw)
 
-    # If JSON-LD missing, fallback to HTML list extraction
-    if not ingredients or not instructions:
-        fb = extract_from_html_fallback(soup)
-        if not ingredients:
-            ingredients = fb["ingredients"]
-        if not instructions:
-            instructions = fb["instructions"]
+def extract_from_html(soup: BeautifulSoup) -> Dict[str, Any]:
+    """
+    Fallback when JSON-LD isn’t usable: try to pick <li> items for ingredients
+    and numbered/step lists for instructions.
+    """
+    # Ingredients candidates
+    ing_candidates = []
+    for sel in [
+        # common patterns
+        "[class*='ingredient'] li",
+        "[id*='ingredient'] li",
+        "li[itemprop='recipeIngredient']",
+    ]:
+        ing_candidates = [clean_str(li.get_text(" ")) for li in soup.select(sel)]
+        if len(ing_candidates) >= 2:
+            break
+    ing_candidates = split_runons(ing_candidates)
 
-    ingredients = normalize_text_items(ingredients)
-    instructions = normalize_text_items(instructions)
+    # Instructions candidates
+    inst_candidates = []
+    for sel in [
+        "[class*='instruction'] li",
+        "[id*='instruction'] li",
+        "li[itemprop='recipeInstructions']",
+        "[class*='instruction'] p",
+    ]:
+        inst_candidates = [clean_str(x.get_text(" ")) for x in soup.select(sel)]
+        if len(inst_candidates) >= 2:
+            break
 
-    # Times
-    times = Times(
-        prepTime=iso8601_to_human(data.get("prepTime")),
-        cookTime=iso8601_to_human(data.get("cookTime")),
-        totalTime=iso8601_to_human(data.get("totalTime")),
-    )
+    return {
+        "title": clean_str(soup.title.get_text()) if soup.title else "",
+        "description": "",
+        "author": "",
+        "ingredients": [i for i in ing_candidates if i],
+        "instructions": [i for i in inst_candidates if i],
+        "times": {},
+        "nutrition": {},
+        "tags": [],
+    }
 
-    # Nutrition (JSON-LD often has it as nested object)
-    nutrition = {}
-    if isinstance(data.get("nutrition"), dict):
-        nutrition = {k: v for k, v in data["nutrition"].items() if v}
 
-    # Tags and author if present
-    tags = []
-    if isinstance(data.get("recipeCategory"), list):
-        tags += [str(x) for x in data["recipeCategory"] if x]
-    elif isinstance(data.get("recipeCategory"), str):
-        tags.append(data["recipeCategory"])
-    if isinstance(data.get("recipeCuisine"), list):
-        tags += [str(x) for x in data["recipeCuisine"] if x]
-    elif isinstance(data.get("recipeCuisine"), str):
-        tags.append(data["recipeCuisine"])
-
-    author = None
-    a = data.get("author")
-    if isinstance(a, dict):
-        author = a.get("name")
-    elif isinstance(a, list) and a and isinstance(a[0], dict):
-        author = a[0].get("name")
-    elif isinstance(a, str):
-        author = a
-
-    return Recipe(
-        source_url=url,
-        title=title,
-        description=description,
-        ingredients=ingredients,
-        instructions=instructions,
-        times=times,
-        nutrition=nutrition,
-        tags=tags,
-        author=author,
-        extracted_at=int(time.time() * 1000),
-    )
-
-# ---- Routes -----------------------------------------------------------------
-
-@app.get("/", tags=["Health"])
+# ---------- Routes ----------
+@app.get("/")
 def health():
     return {"ok": True}
 
-@app.post("/extract", response_model=Recipe, tags=["Extract"])
-def extract(req: ExtractRequest = Body(...)):
+
+@app.post("/extract")
+def extract(req: ExtractRequest):
     html = fetch_html(req.url)
-    return build_recipe(req.url, html)
+    soup = BeautifulSoup(html, "lxml")
+
+    payload = extract_from_jsonld(soup) or extract_from_html(soup)
+
+    # Final schema wrapper
+    return {
+        "schema_version": "1.0.0",
+        "source_url": req.url,
+        **payload,
+        "extracted_at": int(__import__("time").time() * 1000),
+    }
 
