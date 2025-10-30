@@ -277,3 +277,151 @@ def extract(req: ExtractRequest):
         "extracted_at": int(__import__("time").time() * 1000),
     }
 
+# ---- add near your other imports ----
+import json
+import re
+from bs4 import BeautifulSoup
+
+# ---- add these helpers (or merge with your existing utils) ----
+LINK_BLOCK_SELECTORS = [
+    'aside', 'nav', 'footer',
+    '.related', '[class*="related"]',
+    '.promo', '[class*="promo"]',
+    '.newsletter', '[class*="newsletter"]',
+    '.read-more', '[class*="read-more"]',
+    '.jump-to-recipe', '[class*="jump-to-recipe"]',
+    '.toc', '[class*="toc"]'
+]
+
+READMORE_PREFIXES = ('read more', 'read more:', 'more:', 'watch the video')
+
+def _norm_space(s: str) -> str:
+    return re.sub(r'\s+', ' ', s).strip()
+
+def _looks_like_link_list(tag) -> bool:
+    # paragraphs or divs that are basically only links
+    text = tag.get_text(" ", strip=True)
+    links = tag.find_all('a')
+    if not links:
+        return False
+    link_text = " ".join(a.get_text(" ", strip=True) for a in links)
+    # If most of the text is link text (or there are 3+ links), treat as non-body
+    return (len(links) >= 3) or (len(link_text) >= 0.8*len(text) if text else False)
+
+def _has_readmore_prefix(s: str) -> bool:
+    return _norm_space(s).lower().startswith(READMORE_PREFIXES)
+
+def _extract_jsonld_objects(soup: BeautifulSoup):
+    out = []
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(tag.string or "")
+            if isinstance(data, dict):
+                out.append(data)
+            elif isinstance(data, list):
+                out.extend([d for d in data if isinstance(d, dict)])
+        except Exception:
+            continue
+    return out
+
+def _pick_article_from_jsonld(objs):
+    # Prefer Article/BlogPosting with articleBody; some Recipe blobs also include articleBody
+    candidates = []
+    for o in objs:
+        types = o.get("@type")
+        if isinstance(types, list):
+            types = [t.lower() for t in types if isinstance(t, str)]
+        elif isinstance(types, str):
+            types = [types.lower()]
+        else:
+            types = []
+
+        if "article" in types or "newsarticle" in types or "blogposting" in types or "recipe" in types:
+            if "articlebody" in {k.lower(): k for k in o.keys()}:
+                candidates.append(o)
+
+    # prefer the one with longest articleBody
+    if candidates:
+        best = max(candidates, key=lambda x: len((_norm_space(x.get("articleBody", ""))) or ""))
+        headline = best.get("headline") or best.get("name") or ""
+        body = _norm_space(best.get("articleBody", ""))
+        if body:
+            return {
+                "headline": headline or None,
+                "body": [p.strip() for p in re.split(r'\n{2,}', body) if p.strip()]  # split into paragraphs if present
+            }
+    return None
+
+def _extract_article_from_html(soup: BeautifulSoup):
+    # Pick a likely container
+    candidates = []
+    candidates.extend(soup.select('[itemprop="articleBody"]'))
+    candidates.extend(soup.select('article'))
+    candidates.extend(soup.select('main'))
+    container = None
+    # choose the one with the most paragraph text
+    best_score = 0
+    for c in candidates:
+        # clone then drop obvious non-body blocks inside
+        c = c.__copy__() if hasattr(c, '__copy__') else c
+        for sel in LINK_BLOCK_SELECTORS:
+            for bad in c.select(sel):
+                bad.decompose()
+        # score by number of substantial <p>
+        ps = [p for p in c.find_all('p') if _norm_space(p.get_text())]
+        score = sum(len(_norm_space(p.get_text())) for p in ps)
+        if score > best_score:
+            best_score, container = score, c
+
+    if not container:
+        return None
+
+    # Build paragraph list, filtering junk
+    body_paras = []
+    for p in container.find_all('p'):
+        txt = _norm_space(p.get_text(" "))
+        if not txt:
+            continue
+        if _has_readmore_prefix(txt):
+            continue
+        if _looks_like_link_list(p):
+            continue
+        body_paras.append(txt)
+
+    # de-dupe while preserving order
+    seen = set()
+    deduped = []
+    for para in body_paras:
+        if para not in seen:
+            seen.add(para)
+            deduped.append(para)
+
+    if not deduped:
+        return None
+
+    # Headline: try <h1>, else OpenGraph, else title
+    headline = None
+    h1 = soup.find('h1')
+    if h1:
+        headline = _norm_space(h1.get_text(" "))
+    if not headline:
+        og = soup.find('meta', property='og:title')
+        if og and og.get('content'):
+            headline = _norm_space(og['content'])
+    if not headline and soup.title and soup.title.string:
+        headline = _norm_space(soup.title.string)
+
+    return {"headline": headline or None, "body": deduped}
+
+def extract_article_payload(html: str):
+    """Returns {'headline': str|None, 'body': [str,...]} or None"""
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1) Try JSON-LD articleBody
+    jsonld = _extract_jsonld_objects(soup)
+    from_jsonld = _pick_article_from_jsonld(jsonld)
+    if from_jsonld:
+        return from_jsonld
+
+    # 2) Fallback: visible HTML
+    return _extract_article_from_html(soup)
